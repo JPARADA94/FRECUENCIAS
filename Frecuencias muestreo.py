@@ -3,29 +3,45 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 
-# Función principal de análisis
-def analyze_df(df: pd.DataFrame, freq_unit: str) -> (pd.DataFrame, pd.DataFrame):
-    df = df.copy()
-    df['Date Sampled'] = pd.to_datetime(df['Date Sampled'], errors='coerce')
-    df = df.dropna(subset=['Date Sampled'])
+# ======================
+# CACHES PARA OPTIMIZAR
+# ======================
+@st.cache_data
+def load_data(uploaded_file):
+    # Carga solo las columnas necesarias para reducir memoria
+    usecols = [
+        'Unit ID',
+        'Asset ID',
+        'Account Name',
+        'Sample Bottle ID',
+        'Date Sampled',
+        'Asset Class'
+    ]
+    df = pd.read_excel(
+        uploaded_file,
+        usecols=usecols,
+        parse_dates=['Date Sampled']
+    )
+    return df
 
-    # Rango de años de interés: desde 2021 hasta año actual
+@st.cache_data
+def analyze_df(df: pd.DataFrame, freq_unit: str):
+    df = df.dropna(subset=['Date Sampled']).copy()
+    df['Year'] = df['Date Sampled'].dt.year
     current_year = datetime.today().year
     years = list(range(2021, current_year + 1))
-    df['Year'] = df['Date Sampled'].dt.year
 
-    # 1) Conteo de muestras únicas por año y pivote
+    # Conteo anual y pivote
     count = (
         df
-        .groupby(['Unit ID', 'Asset ID', 'Asset Class', 'Account Name', 'Year'])
-        ['Sample Bottle ID']
+        .groupby(['Unit ID', 'Asset ID', 'Asset Class', 'Account Name', 'Year'])['Sample Bottle ID']
         .nunique()
         .reset_index(name='Count')
     )
     pivot = (
         count
         .pivot_table(
-            index=['Unit ID', 'Asset ID', 'Asset Class', 'Account Name'],
+            index=['Unit ID','Asset ID','Asset Class','Account Name'],
             columns='Year',
             values='Count',
             fill_value=0
@@ -34,132 +50,94 @@ def analyze_df(df: pd.DataFrame, freq_unit: str) -> (pd.DataFrame, pd.DataFrame)
         .reset_index()
     )
 
-    # 2) Cálculo de intervalos de muestreo (días)
-    df_sorted = df.sort_values(['Unit ID', 'Asset ID', 'Date Sampled'])
-    df_sorted['Prev Date'] = (
-        df_sorted.groupby(['Unit ID', 'Asset ID'])['Date Sampled'].shift(1)
-    )
-    df_sorted['Interval Days'] = (
-        df_sorted['Date Sampled'] - df_sorted['Prev Date']
-    ).dt.days
-
+    # Calcular intervalos
+    df_sorted = df.sort_values(['Unit ID','Asset ID','Date Sampled'])
+    df_sorted['Prev'] = df_sorted.groupby(['Unit ID','Asset ID'])['Date Sampled'].shift(1)
+    df_sorted['Interval Days'] = (df_sorted['Date Sampled'] - df_sorted['Prev']).dt.days
     avg_interval = (
         df_sorted
-        .groupby(['Unit ID', 'Asset ID', 'Asset Class', 'Account Name'])['Interval Days']
+        .groupby(['Unit ID','Asset ID','Asset Class','Account Name'])['Interval Days']
         .mean()
         .reset_index(name='Avg Interval (Days)')
     )
 
-    # 3) Recomendar frecuencia según unidad
-    if freq_unit == 'Semanas':
-        avg_interval['Recommended Frequency'] = (
-            (avg_interval['Avg Interval (Days)'] / 7)
-            .round(1)
-            .astype(str) + ' semanas'
-        )
-    else:
-        avg_interval['Recommended Frequency'] = (
-            (avg_interval['Avg Interval (Days)'] / 30)
-            .round(1)
-            .astype(str) + ' meses'
-        )
+    # Frecuencia recomendada
+    divisor = 7 if freq_unit == 'Semanas' else 30
+    label = 'semanas' if freq_unit == 'Semanas' else 'meses'
+    avg_interval['Recommended Frequency'] = (
+        (avg_interval['Avg Interval (Days)'] / divisor)
+        .round(1)
+        .astype(str) + f' {label}'
+    )
 
-    # 4) Fechas futuras una por fila
-    future_list = []
+    # Generar fechas futuras
+    future = []
+    today = pd.Timestamp.today().normalize()
+    limit = pd.Timestamp(year=today.year+1, month=12, day=31)
     for _, row in avg_interval.iterrows():
-        unit = row['Unit ID']
-        asset = row['Asset ID']
-        op = row['Account Name']
-        asset_class = row['Asset Class']
-        interval_days = row['Avg Interval (Days)']
-        today = pd.Timestamp.today().normalize()
-        last_date = df_sorted[
-            (df_sorted['Unit ID'] == unit) &
-            (df_sorted['Asset ID'] == asset)
+        last = df_sorted[
+            (df_sorted['Unit ID']==row['Unit ID']) &
+            (df_sorted['Asset ID']==row['Asset ID'])
         ]['Date Sampled'].max().normalize()
-        start = max(today, last_date)
-        end = pd.Timestamp(year=today.year + 1, month=12, day=31)
+        start = max(today, last)
         next_date = start
-        while next_date <= end:
-            next_date += pd.Timedelta(days=interval_days)
-            if next_date.weekday() >= 5:  # ajustar fin de semana
+        while next_date <= limit:
+            next_date += pd.Timedelta(days=row['Avg Interval (Days)'])
+            if next_date.weekday() >= 5:
                 next_date += pd.Timedelta(days=(7 - next_date.weekday()))
-            future_list.append({
-                'Unit ID': unit,
-                'Asset ID': asset,
-                'Asset Class': asset_class,
-                'Account Name': op,
+            future.append({
+                'Unit ID': row['Unit ID'],
+                'Asset ID': row['Asset ID'],
+                'Asset Class': row['Asset Class'],
+                'Account Name': row['Account Name'],
                 'Future Sample Date': next_date.date()
             })
-    future_df = pd.DataFrame(future_list)
 
-    # 5) Unir análisis anual con frecuencia
+    future_df = pd.DataFrame(future)
     result = pivot.merge(
-        avg_interval[['Unit ID', 'Asset ID', 'Recommended Frequency']],
-        on=['Unit ID', 'Asset ID'],
-        how='left'
+        avg_interval[['Unit ID','Asset ID','Recommended Frequency']],
+        on=['Unit ID','Asset ID'], how='left'
     )
     return result, future_df
 
-# Función para convertir DataFrames a Excel bytes con dos hojas
-def to_excel(df1: pd.DataFrame, df2: pd.DataFrame) -> bytes:
+def to_excel(df1, df2):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df1.to_excel(writer, index=False, sheet_name='Muestreo Anual')
         df2.to_excel(writer, index=False, sheet_name='Fechas Futuras')
     return output.getvalue()
 
-# Interfaz Streamlit
-st.title("Análisis de Frecuencia de Muestreo por Operaciones")
+# ================
+# INTERFAZ STREAMLIT
+# ================
+st.title("Análisis de Frecuencia de Muestreo")
 st.markdown(
-    "Sube el archivo **Excel en formato MobilServ** con las columnas:\n"
-    "- Unit ID\n"
-    "- Asset ID\n"
-    "- Account Name\n"
-    "- Sample Bottle ID\n"
-    "- Date Sampled\n"
-    "- Asset Class"
+    "- Formato MobilServ\n"
+    "- Columnas requeridas: Unit ID, Asset ID, Account Name, Sample Bottle ID, Date Sampled, Asset Class"
 )
 
-uploaded_file = st.file_uploader(
-    "Sube el archivo Excel en formato MobilServ",
-    type=["xlsx"]
-)
+uploaded = st.file_uploader("Sube tu Excel MobilServ", type=["xlsx"])
+if uploaded:
+    df = load_data(uploaded)
 
-if uploaded_file:
-    df = pd.read_excel(uploaded_file, parse_dates=['Date Sampled'])
+    ops = df['Account Name'].dropna().unique().tolist()
+    selected = st.multiselect("Operaciones (Account Name)", ops, default=[])
+    run = st.button("Ejecutar Análisis")
 
-    # Selector multiselección de operaciones
-    ops = sorted(df['Account Name'].dropna().unique())
-    selected_ops = st.multiselect(
-        "Selecciona las operaciones (Account Name)",
-        options=ops,
-        default=ops
-    )
-    df_sel = df[df['Account Name'].isin(selected_ops)]
-    st.success(f"Operaciones seleccionadas: {', '.join(selected_ops)} (registros: {len(df_sel)})")
+    if run and selected:
+        df_sel = df[df['Account Name'].isin(selected)]
+        freq_unit = st.selectbox("Frecuencia en:", ['Semanas','Meses'])
+        annual_df, future_df = analyze_df(df_sel, freq_unit)
 
-    # Elegir unidad de frecuencia
-    freq_unit = st.selectbox(
-        "Unidad de frecuencia recomendada",
-        ['Semanas', 'Meses']
-    )
+        st.subheader("Muestreo Anual")
+        st.dataframe(annual_df)
+        st.subheader("Fechas Futuras (una por fila)")
+        st.dataframe(future_df)
 
-    # Ejecutar análisis
-    annual_df, future_df = analyze_df(df_sel, freq_unit)
-
-    # Mostrar tablas
-    st.subheader("Muestreo Anual (por año)")
-    st.dataframe(annual_df)
-
-    st.subheader("Fechas de Toma de Muestras Futuras")
-    st.dataframe(future_df)
-
-    # Botón de descarga
-    excel_data = to_excel(annual_df, future_df)
-    st.download_button(
-        label="Descargar resultados en Excel",
-        data=excel_data,
-        file_name="sampling_analysis_full.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        data = to_excel(annual_df, future_df)
+        st.download_button(
+            "Descargar Excel",
+            data=data,
+            file_name="sampling_analysis_full.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
