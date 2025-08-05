@@ -3,13 +3,10 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 
-# Nota: asegúrate de tener instalado 'openpyxl' para leer .xlsx:
-# pip install openpyxl
-
 # ======================
-# CACHE PARA OPTIMIZAR
+# CACHES PARA OPTIMIZAR
 # ======================
-@st.cache
+@st.cache_data
 def load_data(uploaded_file):
     """
     Carga el archivo (CSV o XLSX) y retorna un DataFrame con las columnas necesarias.
@@ -18,13 +15,18 @@ def load_data(uploaded_file):
     if filename.endswith('.csv'):
         df = pd.read_csv(uploaded_file, parse_dates=['Date Sampled'])
     else:
-        # Para .xlsx, pandas usará openpyxl por defecto
         df = pd.read_excel(uploaded_file, parse_dates=['Date Sampled'])
-    # Filtrar solo las columnas que necesitamos
-    cols = ['Unit ID', 'Asset ID', 'Account Name', 'Sample Bottle ID', 'Date Sampled', 'Asset Class']
+    cols = [
+        'Unit ID',
+        'Asset ID',
+        'Account Name',
+        'Sample Bottle ID',
+        'Date Sampled',
+        'Asset Class'
+    ]
     return df[cols]
 
-@st.cache
+@st.cache_data
 def analyze_df(df: pd.DataFrame, freq_unit: str):
     """
     Retorna dos DataFrames:
@@ -106,6 +108,7 @@ def analyze_df(df: pd.DataFrame, freq_unit: str):
         on=['Unit ID','Asset ID'],
         how='left'
     )
+
     return result, future_df
 
 def to_excel(df1: pd.DataFrame, df2: pd.DataFrame) -> bytes:
@@ -158,3 +161,4 @@ if uploaded:
             file_name="sampling_analysis_full.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
