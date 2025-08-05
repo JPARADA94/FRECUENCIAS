@@ -4,15 +4,15 @@ from io import BytesIO
 from datetime import datetime
 
 # ======================
-# CACHES PARA OPTIMIZAR
+# CACHE PARA OPTIMIZAR
 # ======================
 @st.cache_data
 def load_data(uploaded_file):
     """
-    Carga el archivo CSV o XLSX y retorna solo las columnas necesarias.
+    Carga CSV o XLSX y retorna solo las columnas necesarias.
     """
-    filename = uploaded_file.name.lower()
-    if filename.endswith(".csv"):
+    fname = uploaded_file.name.lower()
+    if fname.endswith(".csv"):
         df = pd.read_csv(uploaded_file, parse_dates=["Date Sampled"])
     else:
         df = pd.read_excel(uploaded_file, parse_dates=["Date Sampled"])
@@ -29,99 +29,120 @@ def load_data(uploaded_file):
 @st.cache_data
 def analyze_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula, para cada equipo y cada año:
-      - número de muestras
-      - meses entre muestras (12 / count) -> frecuencia en meses
-    Añade además una recomendación promedio (meses) por equipo.
+    1) Cuenta muestras por año (pivot desde 2021).
+    2) Calcula intervalo entre muestras y su mediana.
+    3) Recomienda frecuencia en meses = mediana_días / 30.
     """
     df = df.dropna(subset=["Date Sampled"]).copy()
     df["Year"] = df["Date Sampled"].dt.year
 
-    # Años desde 2021 hasta el actual
+    # Definir años de 2021 hasta actual
     current_year = datetime.today().year
     years = list(range(2021, current_year + 1))
 
     # 1) Conteo de muestras únicas por año
     cnt = (
-        df
-        .groupby(["Unit ID", "Asset ID", "Asset Class", "Account Name", "Year"])["Sample Bottle ID"]
+        df.groupby(
+            ["Unit ID", "Asset ID", "Asset Class", "Account Name", "Year"]
+        )["Sample Bottle ID"]
         .nunique()
         .reset_index(name="Samples")
     )
-
-    # 2) Pivot: muestras por año
     pivot = (
-        cnt
-        .pivot_table(
+        cnt.pivot_table(
             index=["Unit ID", "Asset ID", "Asset Class", "Account Name"],
             columns="Year",
             values="Samples",
-            fill_value=0
+            fill_value=0,
         )
         .reindex(columns=years, fill_value=0)
         .reset_index()
     )
 
-    # 3) Calcular frecuencia en meses: 12 / muestras
-    freq_df = pivot[["Unit ID", "Asset ID", "Asset Class", "Account Name"]].copy()
-    for y in years:
-        freq_df[f"{y} (meses)"] = pivot[y].apply(
-            lambda c: round(12 / c, 1) if c > 0 else None
-        )
-
-    # 4) Recomendación general: promedio de frecuencias de año
-    freq_cols = [f"{y} (meses)" for y in years]
-    freq_df["Recommended Frequency (meses)"] = (
-        freq_df[freq_cols]
-        .mean(axis=1, skipna=True)
-        .round(1)
+    # 2) Calcular todos los intervalos en días
+    df_sorted = df.sort_values(
+        ["Unit ID", "Asset ID", "Date Sampled"]
     )
+    df_sorted["Prev"] = (
+        df_sorted.groupby(
+            ["Unit ID", "Asset ID"]
+        )["Date Sampled"]
+        .shift(1)
+    )
+    df_sorted["Interval Days"] = (
+        df_sorted["Date Sampled"] - df_sorted["Prev"]
+    ).dt.days
 
-    # 5) Unir conteos y frecuencias
+    # 3) Mediana de intervalos
+    med = (
+        df_sorted.groupby(
+            ["Unit ID", "Asset ID", "Asset Class", "Account Name"]
+        )["Interval Days"]
+        .median()
+        .reset_index(name="Median Interval (Days)")
+    )
+    # 4) Frecuencia recomendada en meses
+    med["Recommended Frequency (Months)"] = (
+        med["Median Interval (Days)"] / 30
+    ).round(1)
+
+    # 5) Unir conteos anuales con mediana y recomendación
     result = pivot.merge(
-        freq_df.drop(columns=["Unit ID", "Asset ID", "Asset Class", "Account Name"]),
-        left_index=True,
-        right_index=True
+        med[
+            [
+                "Unit ID",
+                "Asset ID",
+                "Median Interval (Days)",
+                "Recommended Frequency (Months)",
+            ]
+        ],
+        on=["Unit ID", "Asset ID"],
+        how="left",
     )
 
     return result
 
 def to_excel(df: pd.DataFrame) -> bytes:
     """
-    Genera un Excel con la hoja 'Frecuencia Anual'.
+    Genera un Excel con hoja 'Frecuencia Mensual Recomendada'.
     """
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Frecuencia Anual")
+        df.to_excel(
+            writer,
+            index=False,
+            sheet_name="Recommended Sampling",
+        )
     return output.getvalue()
 
 # ====================
 # INTERFAZ STREAMLIT
 # ====================
-st.title("Análisis de Frecuencia de Muestreo (meses)")
+st.title("Análisis de Frecuencia de Muestreo (Mediana)")
 st.markdown(
     "- Formato MobilServ\n"
-    "- Columnas obligatorias: Unit ID, Asset ID, Account Name, Sample Bottle ID, Date Sampled, Asset Class\n"
+    "- Columnas obligatorias: Unit ID, Asset ID, Account Name,\n"
+    "  Sample Bottle ID, Date Sampled, Asset Class\n"
     "- Sube CSV o XLSX"
 )
 
+# Paso 1: subir archivo
 uploaded = st.file_uploader("1) Sube tu archivo MobilServ", type=["csv", "xlsx"])
 if not uploaded:
-    st.info("**2) Selecciona operaciones** (primero sube el archivo).")
+    st.info("Por favor sube primero el archivo.")
     st.stop()
 
 df = load_data(uploaded)
 
-# 2) Selector de operaciones (vacío al inicio)
+# Paso 2: selección de operaciones (vacío al inicio)
 ops = sorted(df["Account Name"].dropna().unique())
 selected_ops = st.multiselect(
-    "2) Selecciona las operaciones (Account Name)",
+    "2) Selecciona operaciones (Account Name)",
     options=ops,
     default=[],
 )
-
 if not selected_ops:
-    st.info("Por favor selecciona al menos una operación para continuar.")
+    st.info("Selecciona al menos una operación para continuar.")
     st.stop()
 
 # Filtrar y analizar
@@ -129,14 +150,14 @@ df_sel = df[df["Account Name"].isin(selected_ops)]
 result_df = analyze_df(df_sel)
 
 # Mostrar resultados
-st.subheader("Frecuencia de muestreo por año (en meses)")
+st.subheader("Frecuencia recomendada basada en mediana de intervalos")
 st.dataframe(result_df, use_container_width=True)
 
-# Descargar
-excel_data = to_excel(result_df)
+# Descargar Excel
+excel_bytes = to_excel(result_df)
 st.download_button(
-    label="📥 Descargar resultados en Excel",
-    data=excel_data,
-    file_name="sampling_frequency_months.xlsx",
+    "📥 Descargar recomendación en Excel",
+    data=excel_bytes,
+    file_name="sampling_median_recommendation.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
